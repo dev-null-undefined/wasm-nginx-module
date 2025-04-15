@@ -70,7 +70,7 @@ ngx_wasm_wasmedge_get_resources(void *data) {
 
 
 static void *
-ngx_wasm_wasmedge_load(const char *bytecode, size_t size)
+ngx_wasm_wasmedge_load(const char *bytecode, size_t size, ngx_wasm_vm_limits_t *limits)
 {
     ngx_wasm_wasmedge_plugin_t      *plugin;
     size_t                           i;

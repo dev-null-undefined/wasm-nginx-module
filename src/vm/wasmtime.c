@@ -23,17 +23,20 @@
 #include <http/ngx_http_wasm_api_wasmtime.h>
 #include "vm.h"
 
-// max value of int64 - underlying fuel limit in Wasmtime
-#define WASMTIME_EXECUTION_FUEL_LIMIT 0x7FFFFFFFFFFFFFFF
+typedef struct {
+    uint64_t    fuel_limit_call;
+    uint64_t    fuel_limit_lifetime;
+} ngx_wasm_wasmtime_resources_t;
 
 typedef struct {
-    wasm_engine_t           *vm_engine;
-    wasmtime_module_t       *module;
-    wasmtime_store_t        *store;
-    wasmtime_context_t      *context;
-    wasmtime_linker_t       *linker;
-    wasmtime_instance_t      instance;
-    wasmtime_memory_t        memory;
+    wasm_engine_t                  *vm_engine;
+    wasmtime_module_t              *module;
+    wasmtime_store_t               *store;
+    wasmtime_context_t             *context;
+    wasmtime_linker_t              *linker;
+    wasmtime_instance_t             instance;
+    wasmtime_memory_t               memory;
+    ngx_wasm_wasmtime_resources_t   limits;
 } ngx_wasm_wasmtime_plugin_t;
 
 
@@ -76,16 +79,25 @@ ngx_http_wasmtime_host_api_func(const ngx_wasm_wasmtime_host_api_t *api)
 }
 
 
-static void
+static ngx_int_t
 ngx_wasm_wasmtime_report_error(ngx_log_t *log, const char *message,
     wasmtime_error_t *error, wasm_trap_t *trap)
 {
-    wasm_byte_vec_t error_message;
+    wasm_byte_vec_t         error_message;
+    wasmtime_trap_code_t    code;
 
     if (error != NULL) {
         wasmtime_error_message(error, &error_message);
         wasmtime_error_delete(error);
     } else {
+        if (wasmtime_trap_code(trap, &code)
+            && code == WASMTIME_TRAP_CODE_OUT_OF_FUEL) {
+            wasm_trap_delete(trap);
+            ngx_log_error(NGX_LOG_WARN, log, 0, "%s%s",
+                          message, "all fuel consumed");
+            return NGX_ABORT;
+        }
+
         wasm_trap_message(trap, &error_message);
         wasm_trap_delete(trap);
     }
@@ -93,6 +105,8 @@ ngx_wasm_wasmtime_report_error(ngx_log_t *log, const char *message,
     ngx_log_error(NGX_LOG_ERR, log, 0, "%s%*s",
                   message, error_message.size, error_message.data);
     wasm_byte_vec_delete(&error_message);
+
+    return NGX_ERROR;
 }
 
 
@@ -112,6 +126,51 @@ ngx_wasm_wasmtime_cleanup(void)
 }
 
 
+static ngx_int_t
+ngx_wasm_wasmtime_update_fuel(ngx_wasm_wasmtime_plugin_t *plugin,
+                              uint64_t *consumed, uint64_t *remaining) {
+    bool                            fuel_enabled;
+    uint64_t                        limit;
+    wasmtime_context_t             *context = plugin->context;
+    ngx_wasm_wasmtime_resources_t  *limits = &plugin->limits;
+
+    fuel_enabled = wasmtime_context_fuel_consumed(context, consumed);
+    if (!fuel_enabled) {
+        return NGX_OK;
+    }
+
+    if (limits->fuel_limit_lifetime > 0
+        && limits->fuel_limit_lifetime <= *consumed) {
+        *remaining = 0;
+        return NGX_ABORT;
+    }
+
+    // get how much is remaining in the context
+    // TODO: replace this with remaining_fuel in Wasmtime 11
+    wasmtime_context_consume_fuel(context, 0, remaining);
+
+    if (limits->fuel_limit_call == 0) {
+        return NGX_OK;
+    }
+
+    if (limits->fuel_limit_lifetime > 0) {
+        limit = ngx_min(limits->fuel_limit_call,
+                        limits->fuel_limit_lifetime - *consumed);
+    } else {
+        limit = limits->fuel_limit_call;
+    }
+
+    if (limit > *remaining) {
+        wasmtime_context_add_fuel(context, limit - *remaining);
+        *remaining = limit;
+    } else if (limit < *remaining) {
+        wasmtime_context_consume_fuel(context, *remaining - limit, remaining);
+    }
+
+    return NGX_OK;
+}
+
+
 static ngx_wasm_vm_resources_t
 ngx_wasm_wasmtime_get_resources(void *data) {
     ngx_wasm_vm_resources_t     resources = { 0 };
@@ -128,7 +187,7 @@ ngx_wasm_wasmtime_get_resources(void *data) {
 
 
 static void *
-ngx_wasm_wasmtime_load(const char *bytecode, size_t size)
+ngx_wasm_wasmtime_load(const char *bytecode, size_t size, ngx_wasm_vm_limits_t *limits)
 {
     bool                          ok;
     size_t                        i;
@@ -144,23 +203,30 @@ ngx_wasm_wasmtime_load(const char *bytecode, size_t size)
     wasmtime_context_t           *context;
     ngx_wasm_wasmtime_plugin_t   *plugin;
 
-    // enable fuel consumption - allows us to track CPU usage
     config = wasm_config_new();
     if (config == NULL) {
         ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0, "failed to create new config");
         return NULL;
     }
-    wasmtime_config_consume_fuel_set(config, true);
+
+    if (limits != NULL && (limits->fuel_limit_call > 0
+                           || limits->fuel_limit_lifetime > 0)) {
+        wasmtime_config_consume_fuel_set(config, true);
+    }
 
     vm_engine = wasm_engine_new_with_config(config);
     if (vm_engine == NULL) {
-        ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0, "failed to create new engine");
+        ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+                      "failed to create new engine");
         return NULL;
     }
 
-    error = wasmtime_module_new(vm_engine, (const uint8_t*) bytecode, size, &module);
+    error = wasmtime_module_new(vm_engine, (const uint8_t*) bytecode,
+                                size, &module);
     if (error != NULL) {
-        ngx_wasm_wasmtime_report_error(ngx_cycle->log, "failed to create new module: ", error, NULL);
+        ngx_wasm_wasmtime_report_error(ngx_cycle->log,
+                                       "failed to create new module: ",
+                                       error, NULL);
         goto free_engine;
     }
 
@@ -170,7 +236,13 @@ ngx_wasm_wasmtime_load(const char *bytecode, size_t size)
     }
 
     context = wasmtime_store_context(store);
-    wasmtime_context_add_fuel(context, WASMTIME_EXECUTION_FUEL_LIMIT);
+    if (limits != NULL) {
+        if (limits->fuel_limit_call > 0) {
+            wasmtime_context_add_fuel(context,limits->fuel_limit_call);
+        } else if (limits->fuel_limit_lifetime > 0) {
+            wasmtime_context_add_fuel(context,limits->fuel_limit_lifetime);
+        }
+    }
 
     wasi_config = wasi_config_new();
     if (wasi_config == NULL) {
@@ -184,7 +256,8 @@ ngx_wasm_wasmtime_load(const char *bytecode, size_t size)
 
     error = wasmtime_context_set_wasi(context, wasi_config);
     if (error != NULL) {
-        ngx_wasm_wasmtime_report_error(ngx_cycle->log, "failed to init WASI: ", error, NULL);
+        ngx_wasm_wasmtime_report_error(ngx_cycle->log,
+                                       "failed to init WASI: ", error, NULL);
         goto free_store;
     }
 
@@ -195,7 +268,8 @@ ngx_wasm_wasmtime_load(const char *bytecode, size_t size)
 
     error = wasmtime_linker_define_wasi(linker);
     if (error != NULL) {
-        ngx_wasm_wasmtime_report_error(ngx_cycle->log, "failed to init WASI: ", error, NULL);
+        ngx_wasm_wasmtime_report_error(ngx_cycle->log,
+                                       "failed to init WASI: ", error, NULL);
         goto free_linker;
     }
 
@@ -212,13 +286,15 @@ ngx_wasm_wasmtime_load(const char *bytecode, size_t size)
         }
 
         error = wasmtime_linker_define_func(linker, "env", 3,
-                                            (const char *) api->name.data, api->name.len,
-                                            f,
+                                            (const char *) api->name.data,
+                                            api->name.len, f,
                                             api->cb, NULL, NULL);
         wasm_functype_delete(f);
 
         if (error != NULL) {
-            ngx_wasm_wasmtime_report_error(ngx_cycle->log, "failed to define API ", error, NULL);
+            ngx_wasm_wasmtime_report_error(ngx_cycle->log,
+                                           "failed to define API ",
+                                           error, NULL);
             goto free_linker;
         }
     }
@@ -228,15 +304,19 @@ ngx_wasm_wasmtime_load(const char *bytecode, size_t size)
         goto free_linker;
     }
 
-    error = wasmtime_linker_instantiate(linker, context, module, &plugin->instance, &trap);
+    error = wasmtime_linker_instantiate(linker, context, module,
+                                        &plugin->instance, &trap);
     if (error != NULL) {
-        ngx_wasm_wasmtime_report_error(ngx_cycle->log, "failed to new instance: ", error, NULL);
+        ngx_wasm_wasmtime_report_error(ngx_cycle->log,
+                                       "failed to new instance: ", error, NULL);
         goto free_plugin;
     }
 
-    ok = wasmtime_instance_export_get(context, &plugin->instance, "memory", strlen("memory"), &item);
+    ok = wasmtime_instance_export_get(context, &plugin->instance,
+                                      "memory", strlen("memory"), &item);
     if (!ok || item.kind != WASMTIME_EXTERN_MEMORY) {
-        ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0, "the wasm plugin doesn't export memory");
+        ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+                      "the wasm plugin doesn't export memory");
         goto free_plugin;
     }
     plugin->memory = item.of.memory;
@@ -247,6 +327,13 @@ ngx_wasm_wasmtime_load(const char *bytecode, size_t size)
     plugin->store = store;
     plugin->context = context;
     plugin->linker = linker;
+    if (limits != NULL) {
+        plugin->limits.fuel_limit_call = limits->fuel_limit_call;
+        plugin->limits.fuel_limit_lifetime = limits->fuel_limit_lifetime;
+    } else {
+        plugin->limits.fuel_limit_call = 0;
+        plugin->limits.fuel_limit_lifetime = 0;
+    }
 
     ngx_log_error(NGX_LOG_INFO, ngx_cycle->log, 0, "wasmtime loaded plugin");
 
@@ -293,7 +380,7 @@ ngx_wasm_wasmtime_call(void *data, ngx_str_t *name, bool has_result, int param_t
     bool                        found;
     size_t                      param_num = 0;
     va_list                     args;
-    uint64_t                    fc, ftc;
+    uint64_t                    fc, fct = 0, fr = 0;
     ngx_int_t                   rc;
     wasm_trap_t                *trap = NULL;
     wasmtime_val_t             *params = NULL;
@@ -365,27 +452,41 @@ ngx_wasm_wasmtime_call(void *data, ngx_str_t *name, bool has_result, int param_t
         break;
 
     default:
-        ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0, "unknown param type: %d", param_type);
+        ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+                      "unknown param type: %d", param_type);
         va_end(args);
         return NGX_ERROR;
     }
 
     va_end(args);
 
-    wasmtime_context_fuel_consumed(plugin->context, &ftc);
-    fc = ftc;
-
-    error = wasmtime_func_call(plugin->context, &func.of.func, params, param_num, results,
-                               has_result ? 1 : 0, &trap);
-    if (error != NULL || trap != NULL) {
-        ngx_wasm_wasmtime_report_error(ngx_cycle->log, "failed to call function: ", error, trap);
-        return NGX_ERROR;
+    rc = ngx_wasm_wasmtime_update_fuel(plugin, &fct, &fr);
+    if (rc != NGX_OK) {
+        ngx_log_error(NGX_LOG_WARN, ngx_cycle->log, 0,
+                      "not enough resources to execute, consumed [%L/%L]",
+                      fct, plugin->limits.fuel_limit_lifetime);
+        return rc;
     }
+    fc = fct;
 
-    wasmtime_context_fuel_consumed(plugin->context, &ftc);
-    fc = ftc - fc;
+    error = wasmtime_func_call(plugin->context, &func.of.func,
+                               params, param_num, results,
+                               has_result ? 1 : 0, &trap);
+
+    ngx_wasm_wasmtime_update_fuel(plugin, &fct, &fr);
+    fc = fct - fc;
+
     ngx_log_error(NGX_LOG_INFO, ngx_cycle->log, 0,
-                  "%V consumed %L, total %L", name, fc, ftc);
+                  "%V%s consumed [%L/%L], total [%L/%L]",
+                  name, (error != NULL || trap != NULL) ? " failed" : "",
+                  fc, plugin->limits.fuel_limit_call, fct,
+                  plugin->limits.fuel_limit_lifetime);
+
+    if (error != NULL || trap != NULL) {
+        return ngx_wasm_wasmtime_report_error(ngx_cycle->log,
+                                              "failed to call function: ",
+                                              error, trap);
+    }
 
     if (!has_result) {
         ngx_log_debug0(NGX_LOG_DEBUG_CORE, ngx_cycle->log, 0,
@@ -394,7 +495,8 @@ ngx_wasm_wasmtime_call(void *data, ngx_str_t *name, bool has_result, int param_t
     }
 
     if (results[0].kind != WASMTIME_I32) {
-        ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0, "function returns unexpected type: %d",
+        ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+                      "function returns unexpected type: %d",
                       results[0].kind);
         return NGX_ERROR;
     }
@@ -413,8 +515,10 @@ ngx_wasm_wasmtime_has(void *data, ngx_str_t *name)
     ngx_wasm_wasmtime_plugin_t *plugin = data;
     wasmtime_extern_t           func;
 
-    return wasmtime_instance_export_get(plugin->context, &plugin->instance,
-                                        (const char *) name->data, name->len, &func);
+    return wasmtime_instance_export_get(plugin->context,
+                                        &plugin->instance,
+                                        (const char *) name->data,
+                                        name->len, &func);
 }
 
 

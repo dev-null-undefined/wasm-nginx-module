@@ -31,22 +31,26 @@
 #define NGX_WASM_PARAM_I32_I32_I32_I32_I32  6
 
 
-// TODO: add memory + fuel left
+// TODO: add memory and epoch
 typedef struct {
     uint64_t fuel_consumed;
 } ngx_wasm_vm_resources_t;
 
+typedef struct {
+    uint64_t   fuel_limit_call;
+    uint64_t   fuel_limit_lifetime;
+} ngx_wasm_vm_limits_t;
 
 typedef struct {
-    ngx_str_t            *name;
+    ngx_str_t                *name;
 
-    ngx_int_t            (*init)(void);
-    void                 (*cleanup)(void);
+    ngx_int_t               (*init)(void);
+    void                    (*cleanup)(void);
 
-    void            *(*load)(const char *bytecode, size_t size);
-    void             (*unload)(void *plugin);
+    void                   *(*load)(const char *bytecode, size_t size, ngx_wasm_vm_limits_t *limits);
+    void                    (*unload)(void *plugin);
 
-    /**
+    /*
      * Returns current resources limits.
      */
     ngx_wasm_vm_resources_t (*get_resources)(void *plugin);
@@ -55,17 +59,17 @@ typedef struct {
      * get_memory returns a pointer to the given address in WASM.
      * It returns NULL if addr + size is out of bound.
      */
-    u_char          *(*get_memory)(ngx_log_t *log, int32_t addr, int32_t size);
+    u_char                 *(*get_memory)(ngx_log_t *log, int32_t addr, int32_t size);
 
     /*
      * call run a function exported from the plugin.
      */
-    ngx_int_t        (*call)(void *plugin, ngx_str_t *name, bool has_result,
-                             int param_type, ...);
+    ngx_int_t               (*call)(void *plugin, ngx_str_t *name, bool has_result,
+                                    int param_type, ...);
     /*
      * has check if a function is exported from the plugin.
      */
-    bool             (*has)(void *plugin, ngx_str_t *name);
+    bool                    (*has)(void *plugin, ngx_str_t *name);
 } ngx_wasm_vm_t;
 
 

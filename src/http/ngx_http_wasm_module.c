@@ -206,29 +206,37 @@ ngx_http_wasm_init(ngx_conf_t *cf)
 __attribute__((no_sanitize("undefined")))
 void *
 ngx_http_wasm_load_plugin(const char *name, size_t name_len,
-                          const char *bytecode, size_t size)
+                          const char *bytecode, size_t size,
+                          uint64_t fuel_limit_call, uint64_t fuel_limit_lifetime)
 {
     bool                     found;
     void                    *plugin;
     ngx_int_t                rc, i;
+    ngx_wasm_vm_limits_t     limits;
     ngx_http_wasm_plugin_t  *hw_plugin;
     ngx_wasm_vm_resources_t  resources;
 
     if (!ngx_http_wasm_vm_inited) {
-        ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0, "miss wasm_vm configuration");
+        ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+                      "miss wasm_vm configuration");
         return NULL;
     }
 
-    plugin = ngx_wasm_vm->load(bytecode, size);
+    limits.fuel_limit_lifetime = fuel_limit_lifetime;
+    limits.fuel_limit_call = fuel_limit_call;
+
+    plugin = ngx_wasm_vm->load(bytecode, size, &limits);
 
     if (plugin == NULL) {
         return NULL;
     }
 
     if (ngx_wasm_vm->has(plugin, &plugin_start)) {
-        rc = ngx_wasm_vm->call(plugin, &plugin_start, false, NGX_WASM_PARAM_VOID);
+        rc = ngx_wasm_vm->call(plugin, &plugin_start,
+                               false, NGX_WASM_PARAM_VOID);
     } else if (ngx_wasm_vm->has(plugin, &plugin_initialize)) {
-        rc = ngx_wasm_vm->call(plugin, &plugin_initialize, false, NGX_WASM_PARAM_VOID);
+        rc = ngx_wasm_vm->call(plugin, &plugin_initialize,
+                               false, NGX_WASM_PARAM_VOID);
     } else {
         rc = NGX_OK;
     }
@@ -268,7 +276,8 @@ ngx_http_wasm_load_plugin(const char *name, size_t name_len,
     resources = ngx_wasm_vm->get_resources(plugin);
 
     ngx_log_error(NGX_LOG_INFO, ngx_cycle->log, 0,
-                  "plugin %V loaded, consumed %L", &hw_plugin->name,  resources.fuel_consumed);
+                  "plugin %V loaded, consumed %L",
+                  &hw_plugin->name,  resources.fuel_consumed);
 
     return hw_plugin;
 
@@ -337,15 +346,19 @@ ngx_http_wasm_free_plugin_ctx(ngx_http_wasm_plugin_ctx_t *hwp_ctx)
     ngx_queue_remove(&hwp_ctx->queue);
     ngx_queue_insert_head(&hw_plugin->free, &hwp_ctx->queue);
 
-    rc = ngx_wasm_vm->call(plugin, &proxy_on_done, true, NGX_WASM_PARAM_I32, ctx_id);
+    rc = ngx_wasm_vm->call(plugin, &proxy_on_done, true,
+                           NGX_WASM_PARAM_I32, ctx_id);
     if (rc <= 0) {
-        ngx_log_error(NGX_LOG_ERR, log, 0, "failed to mark context %d as done, rc: %d",
+        ngx_log_error(NGX_LOG_WARN, log, 0,
+                      "failed to mark context %d as done, rc: %d",
                       ctx_id, rc);
     }
 
-    rc = ngx_wasm_vm->call(plugin, &proxy_on_delete, false, NGX_WASM_PARAM_I32, ctx_id);
+    rc = ngx_wasm_vm->call(plugin, &proxy_on_delete, false,
+                           NGX_WASM_PARAM_I32, ctx_id);
     if (rc != NGX_OK) {
-        ngx_log_error(NGX_LOG_ERR, log, 0, "failed to delete context %d, rc: %d",
+        ngx_log_error(NGX_LOG_WARN, log, 0,
+                      "failed to delete context %d, rc: %d",
                       ctx_id, rc);
     }
 
@@ -359,7 +372,8 @@ ngx_http_wasm_free_plugin_ctx(ngx_http_wasm_plugin_ctx_t *hwp_ctx)
     }
 
     resources = ngx_wasm_vm->get_resources(plugin);
-    ngx_log_error(NGX_LOG_INFO, log, 0, "plugin %V context %d consumed %L during its lifetime",
+    ngx_log_error(NGX_LOG_INFO, log, 0,
+                  "plugin %V context %d consumed %L during its lifetime",
                   &hw_plugin->name, ctx_id, resources.fuel_consumed);
 
     if (hw_plugin->done) {
@@ -459,7 +473,8 @@ ngx_http_wasm_on_configure(ngx_http_wasm_plugin_t *hw_plugin, const char *conf, 
     ngx_http_wasm_set_state(NULL);
 
     if (rc <= 0) {
-        ngx_log_error(NGX_LOG_ERR, log, 0, "failed to configure plugin context %d, rc: %d",
+        ngx_log_error(NGX_LOG_ERR, log, 0,
+                      "failed to configure plugin context %d, rc: %d",
                       ctx_id, rc);
         goto free_hwp_ctx;
     }
@@ -568,20 +583,26 @@ ngx_http_wasm_cleanup(void *data)
         ngx_queue_insert_head(&hwp_ctx->free, &http_ctx->queue);
 
         rb = ngx_wasm_vm->get_resources(plugin);
-        rc = ngx_wasm_vm->call(plugin, &proxy_on_done, true, NGX_WASM_PARAM_I32, ctx_id);
+        rc = ngx_wasm_vm->call(plugin, &proxy_on_done, true,
+                               NGX_WASM_PARAM_I32, ctx_id);
         if (rc <= 0) {
-            ngx_log_error(NGX_LOG_ERR, log, 0, "failed to mark context %d as done, rc: %d",
+            ngx_log_error(NGX_LOG_WARN, log, 0,
+                          "failed to mark context %d as done, rc: %d",
                           ctx_id, rc);
         }
 
-        rc = ngx_wasm_vm->call(plugin, &proxy_on_delete, false, NGX_WASM_PARAM_I32, ctx_id);
+        rc = ngx_wasm_vm->call(plugin, &proxy_on_delete, false,
+                               NGX_WASM_PARAM_I32, ctx_id);
         if (rc != NGX_OK) {
-            ngx_log_error(NGX_LOG_ERR, log, 0, "failed to delete context %d, rc: %d",
+            ngx_log_error(NGX_LOG_WARN, log, 0,
+                          "failed to delete context %d, rc: %d",
                           ctx_id, rc);
         }
         ra = ngx_wasm_vm->get_resources(plugin);
-        ngx_log_error(NGX_LOG_INFO, log, 0, "plugin %V http context %d consumed %L during cleanup",
-                      &hw_plugin->name, ctx_id, ra.fuel_consumed - rb.fuel_consumed);
+        ngx_log_error(NGX_LOG_INFO, log, 0,
+                      "plugin %V http context %d consumed %L during cleanup",
+                      &hw_plugin->name, ctx_id,
+                      ra.fuel_consumed - rb.fuel_consumed);
 
         if (hwp_ctx->done) {
             ngx_http_wasm_free_plugin_ctx(hwp_ctx);
