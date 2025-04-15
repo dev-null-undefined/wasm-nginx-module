@@ -31,6 +31,12 @@
 #define NGX_WASM_PARAM_I32_I32_I32_I32_I32  6
 
 
+// TODO: add memory + fuel left
+typedef struct {
+    uint64_t fuel_consumed;
+} ngx_wasm_vm_resources_t;
+
+
 typedef struct {
     ngx_str_t            *name;
 
@@ -39,6 +45,11 @@ typedef struct {
 
     void            *(*load)(const char *bytecode, size_t size);
     void             (*unload)(void *plugin);
+
+    /**
+     * Returns current resources limits.
+     */
+    ngx_wasm_vm_resources_t (*get_resources)(void *plugin);
 
     /*
      * get_memory returns a pointer to the given address in WASM.

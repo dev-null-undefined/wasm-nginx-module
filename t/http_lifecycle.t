@@ -14,6 +14,7 @@
 #
 use t::WASM 'no_plan';
 
+log_level('debug');
 run_tests();
 
 __DATA__
@@ -23,17 +24,17 @@ __DATA__
 location /t {
     content_by_lua_block {
         local wasm = require("resty.proxy-wasm")
-        local plugin = assert(wasm.load("plugin", "t/testdata/http_lifecycle/main.go.wasm"))
+        local plugin = assert(wasm.load("plg1", "t/testdata/http_lifecycle/main.go.wasm"))
         local ctx = assert(wasm.on_configure(plugin, '{"body":512}'))
         assert(wasm.on_http_request_headers(ctx))
         assert(wasm.on_http_request_headers(ctx))
     }
 }
 --- grep_error_log eval
-qr/(create|free) http context \d/
---- grep_error_log_out
-create http context 2
-free http context 2
+qr/plugin plg1 .* context 2 .*/
+--- grep_error_log_out eval
+qr/plugin plg1 create http context 2 consumed \d+
+plugin plg1 http context 2 consumed \d+ during cleanup/
 
 
 
@@ -42,7 +43,7 @@ free http context 2
 location /t {
     content_by_lua_block {
         local wasm = require("resty.proxy-wasm")
-        local plugin = assert(wasm.load("plugin", "t/testdata/http_lifecycle/main.go.wasm"))
+        local plugin = assert(wasm.load("plg1", "t/testdata/http_lifecycle/main.go.wasm"))
         do
             local ctx = assert(wasm.on_configure(plugin, '{"body":512}'))
             assert(wasm.on_http_request_headers(ctx))
@@ -51,10 +52,10 @@ location /t {
     }
 }
 --- grep_error_log eval
-qr/free (plugin|http) context \d/
---- grep_error_log_out
-free http context 2
-free plugin context 1
+qr/plugin plg1 (http|context) .* (cleanup|lifetime)/
+--- grep_error_log_out eval
+qr/plugin plg1 http context 2 consumed \d+ during cleanup
+plugin plg1 context 1 consumed \d+ during its lifetime/
 
 
 
@@ -62,7 +63,7 @@ free plugin context 1
 --- http_config
     init_by_lua_block {
         local wasm = require("resty.proxy-wasm")
-        local plugin = assert(wasm.load("plugin", "t/testdata/http_lifecycle/main.go.wasm"))
+        local plugin = assert(wasm.load("plg1", "t/testdata/http_lifecycle/main.go.wasm"))
         package.loaded.ctx = assert(wasm.on_configure(plugin, '{"body":512}'))
     }
 --- config
@@ -101,7 +102,7 @@ location /hit {
     }
 }
 --- grep_error_log eval
-qr/free http context (1|11)$/
+qr/plugin plg1 http context (1|11) consumed \d+ during cleanup/
 --- grep_error_log_out
 
 
@@ -205,7 +206,7 @@ location /hit {
 location /t {
     content_by_lua_block {
         local wasm = require("resty.proxy-wasm")
-        local plugin = wasm.load("plugin", "t/testdata/http_lifecycle/main.go.wasm")
+        local plugin = wasm.load("plg1", "t/testdata/http_lifecycle/main.go.wasm")
         local http = require "resty.http"
         local uri = "http://127.0.0.1:" .. ngx.var.server_port
                     .. "/hit"
@@ -226,14 +227,14 @@ location /t {
     }
 }
 --- grep_error_log eval
-qr/(create|free) (plugin|http) context \d+/
+qr/(create )?plugin plg1 .*/
 --- grep_error_log_out eval
-qr/create plugin context 1
-create http context 2
-free http context 2
-free plugin context 1
-create plugin context 1
-create http context 3
-free http context 3
-free plugin context 1
+qr/create plugin plg1 context 1 consumed \d+
+plugin plg1 create http context 2 consumed \d+
+plugin plg1 http context 2 consumed \d+ during cleanup
+plugin plg1 context 1 consumed \d+ during its lifetime
+create plugin plg1 context 1 consumed \d+
+plugin plg1 create http context 3 consumed \d+
+plugin plg1 http context 3 consumed \d+ during cleanup
+plugin plg1 context 1 consumed \d+ during its lifetime
 /

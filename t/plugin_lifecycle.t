@@ -14,6 +14,7 @@
 #
 use t::WASM 'no_plan';
 
+log_level('debug');
 run_tests();
 
 __DATA__
@@ -153,7 +154,7 @@ proxy_on_done [12]
 /
 --- shutdown_error_log
 proxy_on_done 3
-unloaded wasm plugin
+wasmtime unloaded plugin
 
 
 
@@ -174,18 +175,18 @@ location /t {
     }
 }
 --- grep_error_log eval
-qr/(proxy_on_(configure|done) \d+|unloaded wasm plugin)/
+qr/(proxy_on_(configure|done) \d+|wasmtime unloaded plugin)/
 --- grep_error_log_out eval
 qr/proxy_on_configure 1
 proxy_on_configure 2
 proxy_on_done [12]
 proxy_on_done [12]
-unloaded wasm plugin
+wasmtime unloaded plugin
 proxy_on_configure 1
 proxy_on_configure 2
 proxy_on_done [12]
 proxy_on_done [12]
-unloaded wasm plugin
+wasmtime unloaded plugin
 /
 
 

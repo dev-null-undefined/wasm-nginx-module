@@ -208,10 +208,11 @@ void *
 ngx_http_wasm_load_plugin(const char *name, size_t name_len,
                           const char *bytecode, size_t size)
 {
+    bool                     found;
     void                    *plugin;
     ngx_int_t                rc, i;
-    bool                     found;
     ngx_http_wasm_plugin_t  *hw_plugin;
+    ngx_wasm_vm_resources_t  resources;
 
     if (!ngx_http_wasm_vm_inited) {
         ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0, "miss wasm_vm configuration");
@@ -263,6 +264,12 @@ ngx_http_wasm_load_plugin(const char *name, size_t name_len,
 
     ngx_queue_init(&hw_plugin->occupied);
     ngx_queue_init(&hw_plugin->free);
+
+    resources = ngx_wasm_vm->get_resources(plugin);
+
+    ngx_log_error(NGX_LOG_INFO, ngx_cycle->log, 0,
+                  "plugin %V loaded, consumed %L", &hw_plugin->name,  resources.fuel_consumed);
+
     return hw_plugin;
 
 free_plugin:
@@ -275,12 +282,14 @@ static void
 ngx_http_wasm_free_plugin(ngx_http_wasm_plugin_t *hw_plugin)
 {
     void                    *plugin = hw_plugin->plugin;
+    ngx_wasm_vm_resources_t  resources;
 
     if (!ngx_queue_empty(&hw_plugin->occupied)) {
         /* some plugin ctxs are using it. Do not free */
         return;
     }
 
+    resources = ngx_wasm_vm->get_resources(plugin);
     ngx_wasm_vm->unload(plugin);
 
     while (!ngx_queue_empty(&hw_plugin->free)) {
@@ -292,7 +301,9 @@ ngx_http_wasm_free_plugin(ngx_http_wasm_plugin_t *hw_plugin)
         hwp_ctx = ngx_queue_data(q, ngx_http_wasm_plugin_ctx_t, queue);
         ngx_free(hwp_ctx);
     }
-
+    ngx_log_error(NGX_LOG_INFO, ngx_cycle->log, 0,
+                  "plugin %V consumed %L during its lifetime",
+                  &hw_plugin->name, resources.fuel_consumed);
     ngx_free(hw_plugin);
 }
 
@@ -308,13 +319,15 @@ ngx_http_wasm_unload_plugin(ngx_http_wasm_plugin_t *hw_plugin)
 void
 ngx_http_wasm_free_plugin_ctx(ngx_http_wasm_plugin_ctx_t *hwp_ctx)
 {
-    ngx_int_t                        rc;
+    void                            *plugin;
     uint32_t                         ctx_id = hwp_ctx->id;
-    ngx_http_wasm_plugin_t          *hw_plugin = hwp_ctx->hw_plugin;
-    void                            *plugin = hw_plugin->plugin;
+    ngx_int_t                        rc;
     ngx_log_t                       *log;
+    ngx_http_wasm_plugin_t          *hw_plugin = hwp_ctx->hw_plugin;
+    ngx_wasm_vm_resources_t          resources;
 
     log = ngx_cycle->log;
+    plugin = hw_plugin->plugin;
 
     if (!ngx_queue_empty(&hwp_ctx->occupied)) {
         /* some http ctxs are using it. Do not free */
@@ -345,7 +358,9 @@ ngx_http_wasm_free_plugin_ctx(ngx_http_wasm_plugin_ctx_t *hwp_ctx)
         ngx_queue_init(&hwp_ctx->free);
     }
 
-    ngx_log_error(NGX_LOG_INFO, log, 0, "free plugin context %d", ctx_id);
+    resources = ngx_wasm_vm->get_resources(plugin);
+    ngx_log_error(NGX_LOG_INFO, log, 0, "plugin %V context %d consumed %L during its lifetime",
+                  &hw_plugin->name, ctx_id, resources.fuel_consumed);
 
     if (hw_plugin->done) {
         ngx_http_wasm_free_plugin(hw_plugin);
@@ -364,12 +379,13 @@ ngx_http_wasm_delete_plugin_ctx(ngx_http_wasm_plugin_ctx_t *hwp_ctx)
 void *
 ngx_http_wasm_on_configure(ngx_http_wasm_plugin_t *hw_plugin, const char *conf, size_t size)
 {
-    ngx_int_t                        rc;
     void                            *plugin = hw_plugin->plugin;
-    uint32_t                         ctx_id;
     u_char                          *state_conf;
+    uint32_t                         ctx_id;
+    ngx_int_t                        rc;
     ngx_log_t                       *log;
     ngx_http_wasm_plugin_ctx_t      *hwp_ctx;
+    ngx_wasm_vm_resources_t          rb, ra;
 
     log = ngx_cycle->log;
 
@@ -401,6 +417,7 @@ ngx_http_wasm_on_configure(ngx_http_wasm_plugin_t *hw_plugin, const char *conf, 
         ngx_queue_init(&hwp_ctx->free);
     }
 
+    rb = ngx_wasm_vm->get_resources(plugin);
     ngx_http_wasm_set_state(hw_plugin->state);
 
     rc = ngx_wasm_vm->call(plugin, &proxy_on_context_create, false,
@@ -447,7 +464,10 @@ ngx_http_wasm_on_configure(ngx_http_wasm_plugin_t *hw_plugin, const char *conf, 
         goto free_hwp_ctx;
     }
 
-    ngx_log_error(NGX_LOG_INFO, ngx_cycle->log, 0, "create plugin context %d", ctx_id);
+    ra = ngx_wasm_vm->get_resources(plugin);
+    ngx_log_error(NGX_LOG_INFO, ngx_cycle->log, 0,
+                  "create plugin %V context %d consumed %L",
+                  &hw_plugin->name, ctx_id, ra.fuel_consumed - rb.fuel_consumed);
 
     return hwp_ctx;
 
@@ -460,14 +480,16 @@ free_hwp_ctx:
 ngx_http_wasm_http_ctx_t *
 ngx_http_wasm_create_http_ctx(ngx_http_wasm_plugin_ctx_t *hwp_ctx, ngx_http_request_t *r)
 {
-    ngx_int_t                        rc;
+    void                            *plugin;
     uint32_t                         ctx_id;
-    ngx_http_wasm_http_ctx_t        *http_ctx;
-    ngx_http_wasm_plugin_t          *hw_plugin = hwp_ctx->hw_plugin;
-    void                            *plugin = hw_plugin->plugin;
+    ngx_int_t                        rc;
     ngx_log_t                       *log;
+    ngx_http_wasm_plugin_t          *hw_plugin = hwp_ctx->hw_plugin;
+    ngx_wasm_vm_resources_t          rb, ra;
+    ngx_http_wasm_http_ctx_t        *http_ctx;
 
     log = r->connection->log;
+    plugin = hw_plugin->plugin;
 
     if (!ngx_queue_empty(&hwp_ctx->free)) {
         ngx_queue_t         *q;
@@ -490,6 +512,7 @@ ngx_http_wasm_create_http_ctx(ngx_http_wasm_plugin_ctx_t *hwp_ctx, ngx_http_requ
         http_ctx->hwp_ctx = hwp_ctx;
     }
 
+    rb = ngx_wasm_vm->get_resources(plugin);
     rc = ngx_wasm_vm->call(plugin, &proxy_on_context_create, false,
                           NGX_WASM_PARAM_I32_I32, ctx_id, hwp_ctx->id);
     if (rc != NGX_OK) {
@@ -502,7 +525,10 @@ ngx_http_wasm_create_http_ctx(ngx_http_wasm_plugin_ctx_t *hwp_ctx, ngx_http_requ
 
     ngx_queue_insert_head(&hwp_ctx->occupied, &http_ctx->queue);
 
-    ngx_log_error(NGX_LOG_INFO, ngx_cycle->log, 0, "create http context %d", ctx_id);
+    ra = ngx_wasm_vm->get_resources(plugin);
+    ngx_log_error(NGX_LOG_INFO, ngx_cycle->log, 0,
+                  "plugin %V create http context %d consumed %L",
+                  &hw_plugin->name, ctx_id, ra.fuel_consumed - rb.fuel_consumed);
 
     return http_ctx;
 }
@@ -511,17 +537,21 @@ ngx_http_wasm_create_http_ctx(ngx_http_wasm_plugin_ctx_t *hwp_ctx, ngx_http_requ
 static void
 ngx_http_wasm_cleanup(void *data)
 {
-    ngx_int_t                     rc;
-    ngx_uint_t                    i;
-    ngx_http_wasm_ctx_t          *ctx = data;
-    ngx_array_t                  *http_ctxs = ctx->http_ctxs;
+    void                         *plugin;
     uint32_t                      ctx_id;
+    ngx_int_t                     rc;
+    ngx_log_t                    *log;
+    ngx_uint_t                    i;
+    ngx_array_t                  *http_ctxs;
+    ngx_http_wasm_ctx_t          *ctx = data;
+    ngx_http_wasm_plugin_t       *hw_plugin;
+    ngx_wasm_vm_resources_t       rb, ra;
     ngx_http_wasm_http_ctx_t     *http_ctx;
     ngx_http_wasm_plugin_ctx_t   *hwp_ctx;
-    void                         *plugin;
-    ngx_log_t                    *log;
+
 
     log = ngx_cycle->log;
+    http_ctxs = ctx->http_ctxs;
 
     if (http_ctxs == NULL) {
         return;
@@ -531,11 +561,13 @@ ngx_http_wasm_cleanup(void *data)
         http_ctx = ((ngx_http_wasm_http_ctx_t **) http_ctxs->elts)[i];
         ctx_id = http_ctx->id;
         hwp_ctx = http_ctx->hwp_ctx;
-        plugin = hwp_ctx->hw_plugin->plugin;
+        hw_plugin = hwp_ctx->hw_plugin;
+        plugin = hw_plugin->plugin;
 
         ngx_queue_remove(&http_ctx->queue);
         ngx_queue_insert_head(&hwp_ctx->free, &http_ctx->queue);
 
+        rb = ngx_wasm_vm->get_resources(plugin);
         rc = ngx_wasm_vm->call(plugin, &proxy_on_done, true, NGX_WASM_PARAM_I32, ctx_id);
         if (rc <= 0) {
             ngx_log_error(NGX_LOG_ERR, log, 0, "failed to mark context %d as done, rc: %d",
@@ -547,8 +579,9 @@ ngx_http_wasm_cleanup(void *data)
             ngx_log_error(NGX_LOG_ERR, log, 0, "failed to delete context %d, rc: %d",
                           ctx_id, rc);
         }
-
-        ngx_log_error(NGX_LOG_INFO, log, 0, "free http context %d", ctx_id);
+        ra = ngx_wasm_vm->get_resources(plugin);
+        ngx_log_error(NGX_LOG_INFO, log, 0, "plugin %V http context %d consumed %L during cleanup",
+                      &hw_plugin->name, ctx_id, ra.fuel_consumed - rb.fuel_consumed);
 
         if (hwp_ctx->done) {
             ngx_http_wasm_free_plugin_ctx(hwp_ctx);
@@ -663,6 +696,7 @@ ngx_http_wasm_on_http(ngx_http_wasm_plugin_ctx_t *hwp_ctx, ngx_http_request_t *r
                       ngx_http_wasm_phase_t type, const u_char *body, size_t size,
                       int end_of_body)
 {
+    void                            *plugin;
     ngx_int_t                        rc;
     ngx_log_t                       *log;
     ngx_str_t                       *cb_name;
@@ -705,20 +739,22 @@ ngx_http_wasm_on_http(ngx_http_wasm_plugin_ctx_t *hwp_ctx, ngx_http_request_t *r
         cb_name = &proxy_on_response_body;
     }
 
+    plugin = hwp_ctx->hw_plugin->plugin;
+
     if (type == HTTP_REQUEST_HEADERS || type == HTTP_RESPONSE_HEADERS) {
         if (hwp_ctx->hw_plugin->abi_version == PROXY_WASM_ABI_VER_010) {
-            rc = ngx_wasm_vm->call(hwp_ctx->hw_plugin->plugin,
+            rc = ngx_wasm_vm->call(plugin,
                                    cb_name,
                                    true, NGX_WASM_PARAM_I32_I32, http_ctx->id, 0);
         } else {
-            rc = ngx_wasm_vm->call(hwp_ctx->hw_plugin->plugin,
+            rc = ngx_wasm_vm->call(plugin,
                                    cb_name,
                                    true, NGX_WASM_PARAM_I32_I32_I32, http_ctx->id,
                                    0, 1);
         }
 
     } else {
-        rc = ngx_wasm_vm->call(hwp_ctx->hw_plugin->plugin,
+        rc = ngx_wasm_vm->call(plugin,
                               cb_name,
                               true, NGX_WASM_PARAM_I32_I32_I32, http_ctx->id,
                               size, end_of_body);
@@ -779,8 +815,8 @@ ngx_http_wasm_on_http_call_resp(ngx_http_wasm_plugin_ctx_t *hwp_ctx, ngx_http_re
     ctx->call_resp_body = body;
 
     ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
-                  "run http callback callout id: %d, plugin ctx id: %d",
-                  ctx->callout_id, hwp_ctx->id);
+                  "plugin %V run http callback callout id: %d, plugin ctx id: %d",
+                   &hwp_ctx->hw_plugin->name, ctx->callout_id, hwp_ctx->id);
 
     rc = ngx_wasm_vm->call(hwp_ctx->hw_plugin->plugin,
                           &proxy_on_http_call_response,

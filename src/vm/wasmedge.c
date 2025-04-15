@@ -61,6 +61,14 @@ ngx_wasm_wasmedge_cleanup(void)
 }
 
 
+static ngx_wasm_vm_resources_t
+ngx_wasm_wasmedge_get_resources(void *data) {
+    ngx_wasm_vm_resources_t     resources = { 0 };
+    // TODO: implement support getting resources in WasmEdge
+    return resources;
+}
+
+
 static void *
 ngx_wasm_wasmedge_load(const char *bytecode, size_t size)
 {
@@ -376,6 +384,7 @@ ngx_wasm_vm_t ngx_wasm_wasmedge_vm = {
     ngx_wasm_wasmedge_cleanup,
     ngx_wasm_wasmedge_load,
     ngx_wasm_wasmedge_unload,
+    ngx_wasm_wasmedge_get_resources,
     ngx_wasm_wasmedge_get_memory,
     ngx_wasm_wasmedge_call,
     ngx_wasm_wasmedge_has,
